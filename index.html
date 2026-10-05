@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VK Group Parser</title>
+  <script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    body{font-family:Arial,sans-serif;max-width:1100px;margin:0 auto;padding:24px;background:#f4f6f8;color:#111}
+    .card{background:#fff;padding:22px;border-radius:14px;box-shadow:0 2px 12px #00000012}
+    h1{margin-top:0}.row{display:flex;gap:10px;flex-wrap:wrap}
+    input{flex:1;min-width:260px;padding:12px;border:1px solid #ccd3db;border-radius:9px;font-size:16px}
+    button{padding:12px 16px;border:0;border-radius:9px;background:#2688eb;color:#fff;font-size:15px;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}.secondary{background:#4b5563}
+    #status{margin:14px 0;color:#555;white-space:pre-wrap}
+    table{width:100%;border-collapse:collapse;font-size:13px;margin-top:15px}
+    th,td{border-bottom:1px solid #e5e7eb;padding:9px;text-align:left;vertical-align:top}
+    th{position:sticky;top:0;background:#fff}a{color:#2688eb}
+    .tablewrap{overflow:auto;max-height:62vh}
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>VK Group Parser</h1>
+  <p>Введите запрос, например: <b>школа балета</b></p>
+  <div class="row">
+    <input id="query" placeholder="Что ищем?">
+    <button id="search">Найти сообщества</button>
+    <button id="download" class="secondary" disabled>Скачать Excel</button>
+  </div>
+  <div id="status">Готово к работе.</div>
+  <div class="tablewrap"><table id="table"></table></div>
+</div>
+
+<script>
+const APP_ID = 54805317;
+const API_VERSION = '5.199';
+let rows = [];
+
+const $ = id => document.getElementById(id);
+function status(s){ $('status').textContent = s; }
+
+async function api(method, params, token){
+  const r = await vkBridge.send('VKWebAppCallAPIMethod', {
+    method,
+    params: {...params, access_token: token, v: API_VERSION}
+  });
+  return r.response;
+}
+
+async function getToken(){
+  const t = await vkBridge.send('VKWebAppGetAuthToken', {
+    app_id: APP_ID,
+    scope: 'groups'
+  });
+  if(!t.access_token) throw new Error('VK не вернул access_token');
+  return t.access_token;
+}
+
+function render(){
+  const table = $('table');
+  table.innerHTML = `<thead><tr>
+    <th>Название</th><th>Ссылка VK</th><th>Подписчики</th><th>Город</th><th>Описание</th>
+  </tr></thead><tbody>` + rows.map(r => `<tr>
+    <td>${esc(r.name)}</td>
+    <td><a target="_blank" href="${esc(r.url)}">${esc(r.url)}</a></td>
+    <td>${r.members_count ?? ''}</td>
+    <td>${esc(r.city || '')}</td>
+    <td>${esc(r.description || '')}</td>
+  </tr>`).join('') + '</tbody>';
+  $('download').disabled = !rows.length;
+}
+
+function esc(v){
+  return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+}
+
+async function search(){
+  const q = $('query').value.trim();
+  if(!q) return status('Введите поисковый запрос.');
+  $('search').disabled = true; $('download').disabled = true; rows = []; render();
+  try{
+    status('Инициализация VK…');
+    await vkBridge.send('VKWebAppInit');
+    status('Запрашиваем разрешение на поиск сообществ…');
+    const token = await getToken();
+
+    let found = [];
+    for(let offset=0; offset<1000; offset+=100){
+      status(`Ищем сообщества… получено ${found.length}`);
+      const res = await api('groups.search', {q, count:100, offset}, token);
+      const items = res.items || [];
+      found.push(...items);
+      if(items.length < 100) break;
+    }
+
+    const byId = new Map();
+    for(let i=0; i<found.length; i+=100){
+      status(`Загружаем данные… ${Math.min(i+100,found.length)} из ${found.length}`);
+      const ids = found.slice(i,i+100).map(g=>g.id).join(',');
+      const details = await api('groups.getById', {
+        group_ids: ids,
+        fields: 'members_count,city,description'
+      }, token);
+      const items = details.groups || details || [];
+      for(const g of items) byId.set(g.id, g);
+    }
+
+    rows = found.map(g => {
+      const d = byId.get(g.id) || g;
+      const screen = d.screen_name || g.screen_name || ('club'+g.id);
+      return {
+        name: d.name || g.name || '',
+        url: 'https://vk.com/' + screen,
+        members_count: d.members_count ?? '',
+        city: d.city?.title || '',
+        description: d.description || ''
+      };
+    });
+    render();
+    status(`Готово. Найдено: ${rows.length}. VK API отдаёт не более первых 1000 результатов одного поискового запроса.`);
+  }catch(e){
+    console.error(e);
+    const msg = e?.error_data?.error_msg || e?.message || JSON.stringify(e);
+    status('Ошибка: ' + msg);
+  }finally{
+    $('search').disabled = false;
+  }
+}
+
+function download(){
+  const data = rows.map(r => ({
+    'Название': r.name,
+    'Ссылка VK': r.url,
+    'Подписчики': r.members_count,
+    'Город': r.city,
+    'Описание': r.description
+  }));
+  const ws = XLSX.utils.json_to_sheet(data);
+  ws['!cols'] = [{wch:38},{wch:38},{wch:14},{wch:24},{wch:70}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Группы VK');
+  XLSX.writeFile(wb, 'vk-groups.xlsx');
+}
+
+$('search').addEventListener('click', search);
+$('download').addEventListener('click', download);
+$('query').addEventListener('keydown', e => { if(e.key==='Enter') search(); });
+</script>
+</body>
+</html>
